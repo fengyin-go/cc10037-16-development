@@ -7,6 +7,9 @@ from fastapi import APIRouter, HTTPException
 
 from app.engine.alert_matcher import AlertLevel, AlertRule
 from app.engine.backfill_plan import BackfillEngine
+from app.engine.column_rehearsal import (
+    ColumnCandidate, ColumnRehearsalEngine, ReadRelation,
+)
 from app.engine.validation_executor import CheckLevel, CheckType, QualityRule
 from app.engine.watermark_progress import WatermarkEngine, WatermarkRecord, WatermarkStatus
 from app.orchestrator import ETLOrchestrator
@@ -14,6 +17,9 @@ from app.orchestrator import ETLOrchestrator
 router = APIRouter(prefix="/api/business", tags=["业务编排"])
 
 _orchestrator = ETLOrchestrator()
+_rehearsal_engine = ColumnRehearsalEngine()
+# 内存态演练批次登记表：batch_id -> 演练计划（含分组、版本锁、试跑凭证）
+_rehearsal_plans: dict[str, dict[str, Any]] = {}
 
 
 # ---- 管线编排 ----
@@ -346,3 +352,141 @@ def pipeline_run_report(pipeline_id: str) -> dict[str, Any]:
     )
 
     return _orchestrator.pipeline_run_report(pipeline_id, record, quality)
+
+
+# ---- 列切换批量演练（跨表多选 / 共享消费方分组 / 试跑映射） ----
+
+def _parse_candidates(raw: list[dict[str, Any]]) -> list[ColumnCandidate]:
+    candidates: list[ColumnCandidate] = []
+    for item in raw:
+        try:
+            candidates.append(ColumnCandidate(
+                table_name=item["table_name"],
+                column_name=item["column_name"],
+                candidate_type=item.get("candidate_type", "string"),
+                type_validated=bool(item.get("type_validated", False)),
+                column_version=str(item.get("column_version", "v1")),
+                data_source=item.get("data_source", ""),
+                legacy_column=item.get("legacy_column", ""),
+                legacy_type=item.get("legacy_type", ""),
+            ))
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=f"候选列缺少必填参数: {exc}")
+    return candidates
+
+
+def _parse_relations(raw: list[dict[str, Any]]) -> list[ReadRelation]:
+    relations: list[ReadRelation] = []
+    for item in raw:
+        try:
+            relations.append(ReadRelation(
+                consumer_job=item["consumer_job"],
+                table_name=item["table_name"],
+                column_name=item["column_name"],
+                data_source=item.get("data_source", ""),
+            ))
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=f"读取关系缺少必填参数: {exc}")
+    return relations
+
+
+def _require_plan(batch_id: str) -> dict[str, Any]:
+    plan = _rehearsal_plans.get(batch_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"演练批次 {batch_id} 不存在")
+    return plan
+
+
+@router.post("/column-rehearsal/batches")
+def create_rehearsal_batch(body: dict[str, Any]) -> dict[str, Any]:
+    """提交跨表多选的候选批次，按共享消费方生成分组演练计划。
+
+    body:
+      batch_id,
+      candidates: [{"table_name", "column_name", "candidate_type", "type_validated",
+                    "column_version", "data_source", "legacy_column", "legacy_type"}],
+      read_relations: [{"consumer_job", "table_name", "column_name", "data_source"}]
+    """
+    batch_id = body.get("batch_id", "").strip()
+    if not batch_id:
+        raise HTTPException(status_code=400, detail="缺少必填参数: batch_id")
+    candidates = _parse_candidates(body.get("candidates", []))
+    if not candidates:
+        raise HTTPException(status_code=400, detail="候选批次至少包含一个候选列")
+    relations = _parse_relations(body.get("read_relations", []))
+
+    plan = _rehearsal_engine.build_rehearsal_plan(batch_id, candidates, relations)
+    _rehearsal_plans[batch_id] = plan
+    return {
+        "summary": _rehearsal_engine.plan_summary(plan),
+        "plan": _rehearsal_engine.serialize_plan(plan),
+        "field_mappings": _rehearsal_engine.build_field_mappings(plan),
+    }
+
+
+@router.get("/column-rehearsal/batches/{batch_id}")
+def get_rehearsal_batch(batch_id: str) -> dict[str, Any]:
+    """查看批次的分组演练数据、字段映射和各组最新状态。"""
+    plan = _require_plan(batch_id)
+    return {
+        "summary": _rehearsal_engine.plan_summary(plan),
+        "plan": _rehearsal_engine.serialize_plan(plan),
+        "field_mappings": _rehearsal_engine.build_field_mappings(plan),
+    }
+
+
+@router.post("/column-rehearsal/batches/{batch_id}/groups/{group_id}/run")
+def run_rehearsal_group(batch_id: str, group_id: str) -> dict[str, Any]:
+    """对单个表组执行成套试跑（独立维表组可先行，共享消费方组整组阻断/通过）。"""
+    plan = _require_plan(batch_id)
+    try:
+        result = _rehearsal_engine.run_group(plan, group_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return result
+
+
+@router.post("/column-rehearsal/batches/{batch_id}/groups/{group_id}/interrupt")
+def interrupt_rehearsal_group(batch_id: str, group_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """标记演练中断，保留该组锁定的列版本与数据源。"""
+    plan = _require_plan(batch_id)
+    try:
+        return _rehearsal_engine.interrupt_group(
+            plan, group_id, body.get("reason", "未说明的中断原因"),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/column-rehearsal/batches/{batch_id}/groups/{group_id}/retry")
+def retry_rehearsal_group(batch_id: str, group_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """中断后重试：沿用该组原来的列版本和数据源，漂移则拒绝。
+
+    body 可携带最新 candidates（例如日期列已补完类型校验），
+    不传则沿用批次内已登记的候选列快照。
+    """
+    plan = _require_plan(batch_id)
+    candidates = (
+        _parse_candidates(body["candidates"])
+        if body.get("candidates")
+        else list(plan["candidate_index"].values())
+    )
+    relations = (
+        _parse_relations(body["read_relations"])
+        if body.get("read_relations")
+        else list(plan["read_relations"])
+    )
+    try:
+        return _rehearsal_engine.retry_group(plan, group_id, candidates, relations)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/column-rehearsal/batches/{batch_id}/groups/{group_id}/trace")
+def trace_rehearsal_group(batch_id: str, group_id: str) -> dict[str, Any]:
+    """追溯已确认表组（含独立维表组）的演练凭证与锁定快照。"""
+    plan = _require_plan(batch_id)
+    try:
+        return _rehearsal_engine.trace_confirmed_group(plan, group_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
